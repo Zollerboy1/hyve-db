@@ -1,0 +1,16 @@
+[package]
+name = "hyve-db"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+cbor4ii = { workspace = true }
+derive-where = { workspace = true }
+either = "1.15.0"
+futures = { workspace = true }
+rusqlite = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
