@@ -9,7 +9,7 @@ use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::Id;
+use crate::{Id, command::TransactionCommandResponse};
 
 #[derive(Debug, Clone, Error, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -55,10 +55,18 @@ pub enum Error {
     Db(#[from] db::Error),
     #[error("Encoding error: {0}")]
     Encoding(#[from] cbor4ii::serde::EncodeError<TryReserveError>),
+    #[error("Transaction error: {0}")]
+    Transaction(#[from] TransactionCommandResponse),
+    #[error("Id parsing error: {0}")]
+    Id(#[from] ulid::DecodeError),
+    #[error("Parser error: {0}")]
+    Parser(String),
     #[error("Foreign error: {0}")]
     Foreign(String),
     #[error("Could not send command")]
     CommandSend,
+    #[error("Could not send command response")]
+    CommandResponseSend,
     #[error("Could not recieve command response")]
     CommandResponseReceive,
     #[error("Could not send peers")]
@@ -73,6 +81,14 @@ pub enum Error {
     ExitedConfiguration,
     #[error("Could not send abandoned tasks")]
     AbandonedTasksSend,
+    #[error("Could not find expired cache entry")]
+    ExpiredCacheEntryNotFound,
+    #[error("Could not send expired cache entry")]
+    ExpiredCacheEntrySend,
+    #[error("Command timed out")]
+    CommandTimeout,
+    #[error("Replication hash not found")]
+    ReplicationHashNotFound,
 }
 
 impl From<raft::Error<Self>> for Error {

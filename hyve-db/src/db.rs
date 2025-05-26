@@ -18,11 +18,40 @@ pub enum Error {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub trait Command {
+    type State;
     type Output;
 
-    fn migrate(conn: &mut Connection) -> Result<()>;
+    fn migrate_with_state(
+        conn: &mut Connection,
+        state: &mut Self::State,
+    ) -> impl Future<Output = Result<()>>;
 
-    fn execute(self, conn: &mut Connection) -> Result<Self::Output>;
+    fn execute_with_state(
+        self,
+        conn: &mut Connection,
+        state: &mut Self::State,
+    ) -> impl Future<Output = Result<Self::Output>>;
+}
+
+pub trait StatelessCommand {
+    type Output;
+
+    fn migrate(conn: &mut Connection) -> impl Future<Output = Result<()>>;
+
+    fn execute(self, conn: &mut Connection) -> impl Future<Output = Result<Self::Output>>;
+}
+
+impl<C: StatelessCommand> Command for C {
+    type State = ();
+    type Output = <C as StatelessCommand>::Output;
+
+    async fn migrate_with_state(conn: &mut Connection, _state: &mut ()) -> Result<()> {
+        C::migrate(conn).await
+    }
+
+    async fn execute_with_state(self, conn: &mut Connection, _state: &mut ()) -> Result<C::Output> {
+        C::execute(self, conn).await
+    }
 }
 
 pub type CommandChannelItem<C> = (C, oneshot::Sender<Result<<C as Command>::Output>>);
@@ -60,7 +89,11 @@ impl<C: Command> Database<C> {
         Self::open(OpenKind::InMemory)
     }
 
-    pub async fn run(mut self, cancellation_token: CancellationToken) -> Result<()> {
+    pub async fn run_with_state(
+        mut self,
+        mut state: C::State,
+        cancellation_token: CancellationToken,
+    ) -> Result<()> {
         let mut conn = match self.open_kind {
             OpenKind::File(path) => Connection::open(path)?,
             OpenKind::InMemory => Connection::open_in_memory()?,
@@ -68,7 +101,7 @@ impl<C: Command> Database<C> {
 
         tracing::info!("Database opened");
 
-        if let Err(e) = C::migrate(&mut conn) {
+        if let Err(e) = C::migrate_with_state(&mut conn, &mut state).await {
             tracing::error!("Database migration failed: {}", e);
             return Err(e);
         }
@@ -81,7 +114,7 @@ impl<C: Command> Database<C> {
                     break;
                 }
                 Some((command, sender)) = self.command_receiver.recv() => {
-                    let result = command.execute(&mut conn);
+                    let result = command.execute_with_state(&mut conn, &mut state).await;
                     sender.send(result).map_err(|_| Error::SendResult)?;
                 }
                 else => {
@@ -91,5 +124,12 @@ impl<C: Command> Database<C> {
         }
 
         Ok(())
+    }
+
+    pub async fn run(self, cancellation_token: CancellationToken) -> Result<()>
+    where
+        C: Command<State = ()>,
+    {
+        self.run_with_state((), cancellation_token).await
     }
 }

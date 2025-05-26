@@ -1,5 +1,6 @@
 use std::{
     fmt::{self, Display},
+    path::PathBuf,
     time::Duration,
 };
 
@@ -51,7 +52,7 @@ fn replication_factor_parser(s: &str) -> Result<usize, String> {
     number_range(s, 3, 10)
 }
 
-#[derive(Debug, Clone, Parser)]
+#[derive(Debug, Parser)]
 pub struct Cli {
     #[arg(long, value_parser = max_nodes_parser)]
     pub max_nodes: usize,
@@ -61,6 +62,8 @@ pub struct Cli {
     pub peers: Vec<u16>,
     #[arg(long, value_parser = replication_factor_parser)]
     pub replication_factor: usize,
+    #[arg(long)]
+    pub migration_file: PathBuf,
     #[arg(long, value_parser = humantime::parse_duration, default_value = "100ms")]
     pub heartbeat_interval: Duration,
     #[arg(
@@ -69,6 +72,10 @@ pub struct Cli {
         default_value_t = DurationRange::new(Duration::from_millis(200), Duration::from_millis(400))
     )]
     pub election_timeout_range: DurationRange,
+    #[arg(long, value_parser = humantime::parse_duration, default_value = "30s")]
+    pub commit_timeout: Duration,
+    #[arg(long, value_parser = humantime::parse_duration, default_value = "10s")]
+    pub command_timeout: Duration,
     #[arg(long, default_value_t = 0)]
     pub seed: u32,
 }

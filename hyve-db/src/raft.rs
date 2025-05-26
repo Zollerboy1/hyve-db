@@ -244,13 +244,13 @@ impl<I: Id> From<Option<I>> for CommandError<I> {
 #[derive(Debug)]
 pub struct CommandHandle<I: Id, C: Command> {
     command: IncomingCommand<I, C>,
-    response_sender: oneshot::Sender<Result<(), CommandError<I>>>,
+    response_sender: oneshot::Sender<Result<(), (CommandError<I>, IncomingCommand<I, C>)>>,
 }
 
 impl<I: Id, C: Command> CommandHandle<I, C> {
     pub fn new(
         command: IncomingCommand<I, C>,
-        response_sender: oneshot::Sender<Result<(), CommandError<I>>>,
+        response_sender: oneshot::Sender<Result<(), (CommandError<I>, IncomingCommand<I, C>)>>,
     ) -> Self {
         Self {
             command,
@@ -260,7 +260,7 @@ impl<I: Id, C: Command> CommandHandle<I, C> {
 
     fn respond<E>(self, response: Result<(), CommandError<I>>) -> Result<(), Error<E>> {
         self.response_sender
-            .send(response)
+            .send(response.map_err(move |e| (e, self.command)))
             .map_err(|_| Error::ResponseChannelClosed)
     }
 }
@@ -286,11 +286,11 @@ pub enum PersistentStateDbCommand<I: Id, C: Command> {
 impl<
     I: Id + Serialize + for<'a> de::Deserialize<'a>,
     C: Command + Serialize + for<'a> de::Deserialize<'a>,
-> db::Command for PersistentStateDbCommand<I, C>
+> db::StatelessCommand for PersistentStateDbCommand<I, C>
 {
     type Output = Option<PersistentState<I, C>>;
 
-    fn migrate(conn: &mut rusqlite::Connection) -> db::Result<()> {
+    async fn migrate(conn: &mut rusqlite::Connection) -> db::Result<()> {
         conn.execute_batch(&format!(
             "BEGIN;
             CREATE TABLE IF NOT EXISTS persistent_state (
@@ -310,7 +310,10 @@ impl<
         .map_err(Into::into)
     }
 
-    fn execute(self, conn: &mut rusqlite::Connection) -> db::Result<Option<PersistentState<I, C>>> {
+    async fn execute(
+        self,
+        conn: &mut rusqlite::Connection,
+    ) -> db::Result<Option<PersistentState<I, C>>> {
         Ok(match self {
             Self::Persist {
                 current_term,
@@ -766,11 +769,11 @@ impl<C: Client> Raft<C> {
 
                             let response = if let IncomingCommand::Configuration(configuration) = handle.command {
                                 if configuration.len() <= self.config.n / 2 {
-                                    Err(CommandError::NotEnoughNodes)
+                                    Err((CommandError::NotEnoughNodes, IncomingCommand::Configuration(configuration)))
                                 } else if configuration.len() > self.config.n {
-                                    Err(CommandError::TooManyNodes)
+                                    Err((CommandError::TooManyNodes, IncomingCommand::Configuration(configuration)))
                                 } else if !configuration.contains(&self.my_id) {
-                                    Err(CommandError::NotAMember)
+                                    Err((CommandError::NotAMember, IncomingCommand::Configuration(configuration)))
                                 } else {
                                     self.initial_configuration = Configuration::Stable(configuration);
                                     self.state = Self::new_follower_state(&self.client).await?;
@@ -781,7 +784,7 @@ impl<C: Client> Raft<C> {
                                     Ok(())
                                 }
                             } else {
-                                Err(CommandError::NotAMember)
+                                Err((CommandError::NotAMember, handle.command))
                             };
 
                             handle
@@ -1319,7 +1322,9 @@ impl<C: Client> Raft<C> {
                     Err(res) => {
                         return handle
                             .response_sender
-                            .send(res)
+                            .send(res.map_err(move |e| {
+                                (e, IncomingCommand::Configuration(configuration))
+                            }))
                             .map_err(|_| Error::ResponseChannelClosed);
                     }
                 }

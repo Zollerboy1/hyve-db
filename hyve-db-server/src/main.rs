@@ -1,4 +1,8 @@
+#![feature(iter_intersperse)]
+#![feature(result_flattening)]
+
 use std::{
+    borrow::Cow,
     collections::HashSet,
     fmt::{self, Display},
     sync::Arc,
@@ -12,15 +16,16 @@ use axum::{
 };
 use clap::Parser as _;
 use cli::Cli;
+use command::{Command, DbState, TransactionCommand, TransactionCommandResponse, Value};
 use derive_where::derive_where;
 use error::{Error, JsonResult, Result};
 use futures::future::{self, FutureExt as _, TryFutureExt as _};
 use hyve_db::{
     db::{self, Database},
     raft::{
-        self, CommandHandle, Config as RaftConfig, IncomingCommand, PersistentState,
-        PersistentStateDbCommand, Raft, Rpc, RpcData, RpcHandle, RpcResponse,
-        RpcResponseChannelItem,
+        self, Client as RaftClient, CommandError, CommandHandle, Config as RaftConfig,
+        IncomingCommand, PersistentState, PersistentStateDbCommand, Raft, Rpc, RpcData, RpcHandle,
+        RpcResponse, RpcResponseChannelItem,
     },
 };
 use peers::Peers;
@@ -39,9 +44,12 @@ use tokio_util::sync::CancellationToken;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt as _, util::SubscriberInitExt as _};
 use ulid::Ulid;
 
+mod cache;
 mod cli;
+mod command;
 mod error;
 mod peers;
+mod replication_client;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -76,8 +84,26 @@ impl From<u16> for Id {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct ReplicationRpcQuery {
+struct ReplicationQuery {
     hash: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MainCommandRequest {
+    command_string: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum MainCommandResponse {
+    Rows { rows: Vec<Vec<Value>> },
+    Inserted { id: Ulid },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ReplicationTransactionRequest<'a> {
+    transaction: Cow<'a, TransactionCommand>,
+    origin: Id,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -88,11 +114,11 @@ struct PeersRequest {
 
 #[derive(Debug)]
 struct ClientBuilder {
-    cli: Cli,
+    cli: Arc<Cli>,
 }
 
 impl ClientBuilder {
-    fn new(cli: Cli) -> Self {
+    fn new(cli: Arc<Cli>) -> Self {
         ClientBuilder { cli }
     }
 }
@@ -112,10 +138,13 @@ impl raft::ClientBuilder for ClientBuilder {
         let (persistent_state_db, persistent_state_command_sender) =
             Database::open_file(format!("{}.db3", self.cli.port));
 
+        let (db, db_command_sender) = Database::open_in_memory();
+
         Ok(Arc::new_cyclic(|client| Client {
             cli: self.cli.clone(),
             reqwest: reqwest::Client::new(),
             persistent_state_db: Mutex::new(Some(persistent_state_db)),
+            db: Mutex::new(Some(db)),
             state: Arc::new(State {
                 main: RaftState {
                     rpc_sender,
@@ -124,11 +153,8 @@ impl raft::ClientBuilder for ClientBuilder {
                 },
                 new_peers_sender,
                 persistent_state_command_sender,
-                peers: Arc::new(RwLock::new(Peers::new(
-                    self.cli,
-                    client.clone(),
-                    cancellation_token.child_token(),
-                ))),
+                db_command_sender,
+                peers: Peers::new(self.cli, client.clone(), cancellation_token.child_token()),
                 new_peers_receiver: Arc::new(Mutex::new(new_peers_receiver)),
             }),
             cancellation_token,
@@ -149,20 +175,22 @@ struct State {
     new_peers_sender: mpsc::Sender<HashSet<Id>>,
     persistent_state_command_sender:
         mpsc::Sender<db::CommandChannelItem<PersistentStateDbCommand<Id, ()>>>,
+    db_command_sender: mpsc::Sender<db::CommandChannelItem<TransactionCommand>>,
     peers: Arc<RwLock<Peers>>,
     new_peers_receiver: Arc<Mutex<mpsc::Receiver<HashSet<Id>>>>,
 }
 
 #[derive(Debug)]
 struct Client {
-    cli: Cli,
+    cli: Arc<Cli>,
     reqwest: reqwest::Client,
     persistent_state_db: Mutex<Option<Database<PersistentStateDbCommand<Id, ()>>>>,
+    db: Mutex<Option<Database<TransactionCommand>>>,
     state: Arc<State>,
     cancellation_token: CancellationToken,
 }
 
-impl raft::Client for Client {
+impl RaftClient for Client {
     type Error = Error;
     type Id = Id;
     type Command = ();
@@ -268,6 +296,11 @@ impl raft::Client for Client {
                         "/replication_rpc",
                         axum::routing::post(Self::handle_replication_rpc),
                     )
+                    .route("/command", axum::routing::post(Self::handle_main_command))
+                    .route(
+                        "/replication_transaction",
+                        axum::routing::post(Self::handle_replication_transaction),
+                    )
                     .route("/peers", axum::routing::post(Self::handle_peers))
                     .with_state(state);
 
@@ -295,6 +328,17 @@ impl raft::Client for Client {
                 tokio::spawn(future::ready(Ok(())))
             };
 
+        let db_task = if let Some(db) = self.db.lock().await.take() {
+            let state = DbState::new(self.cli.clone());
+            let cancellation_token = self.cancellation_token.clone();
+            tokio::spawn(
+                db.run_with_state(state, cancellation_token)
+                    .map_err(Into::into),
+            )
+        } else {
+            tokio::spawn(future::ready(Ok(())))
+        };
+
         let finalize_peers_task = tokio::spawn({
             let state = self.state.clone();
             let cancellation_token = self.cancellation_token.clone();
@@ -311,6 +355,7 @@ impl raft::Client for Client {
             axum_task.map(Result::unwrap),
             peers_task.map(Result::unwrap),
             persistent_state_db_task.map(Result::unwrap),
+            db_task.map(Result::unwrap),
             finalize_peers_task.map(Result::unwrap),
         )
         .map(|_| ())
@@ -322,12 +367,12 @@ impl Client {
         self: &Arc<Self>,
         id: Id,
         replication_hash: u32,
-        rpc: RpcData<Rpc<Id, ()>>,
+        rpc: RpcData<Rpc<Id, replication_client::Command>>,
         response_sender: mpsc::Sender<RpcResponseChannelItem<Self>>,
     ) -> Result<Ulid> {
         let url = format!("http://localhost:{id}/replication_rpc");
 
-        let request_builder = self.reqwest.post(url).query(&ReplicationRpcQuery {
+        let request_builder = self.reqwest.post(url).query(&ReplicationQuery {
             hash: replication_hash,
         });
 
@@ -382,6 +427,42 @@ impl Client {
         Ok(rpc_id)
     }
 
+    async fn send_replication_transaction(
+        self: &Arc<Self>,
+        id: Id,
+        replication_hash: u32,
+        transaction: &TransactionCommand,
+    ) -> Result<TransactionCommandResponse> {
+        let url = format!("http://localhost:{id}/replication_transaction");
+
+        let request_builder = self.reqwest.post(url).query(&ReplicationQuery {
+            hash: replication_hash,
+        });
+
+        tracing::info!("Sending transaction to {replication_hash} raft on {id}");
+
+        let request = ReplicationTransactionRequest {
+            transaction: Cow::Borrowed(transaction),
+            origin: self.id(),
+        };
+
+        future::ready(cbor4ii::serde::to_vec(Vec::new(), &request))
+            .map_err(Into::into)
+            .and_then(move |data| {
+                request_builder
+                    .body(data)
+                    .send()
+                    .and_then(reqwest::Response::json::<JsonResult<_, _>>)
+                    .map_err(Into::into)
+                    .and_then(|res| {
+                        future::ready(
+                            Result::from(res).map_err(|(_, string)| Error::Foreign(string)),
+                        )
+                    })
+            })
+            .await
+    }
+
     async fn handle_main_rpc(
         AxumState(state): AxumState<Arc<State>>,
         body: Bytes,
@@ -405,7 +486,7 @@ impl Client {
 
     async fn handle_replication_rpc(
         AxumState(state): AxumState<Arc<State>>,
-        Query(ReplicationRpcQuery { hash }): Query<ReplicationRpcQuery>,
+        Query(ReplicationQuery { hash }): Query<ReplicationQuery>,
         body: Bytes,
     ) -> JsonResult<RpcData<RpcResponse>, String> {
         Self::handle_replication_rpc_impl(state, body, hash)
@@ -502,6 +583,121 @@ impl Client {
         }
 
         res
+    }
+
+    async fn handle_main_command(
+        AxumState(state): AxumState<Arc<State>>,
+        Json(MainCommandRequest { command_string }): Json<MainCommandRequest>,
+    ) -> JsonResult<MainCommandResponse, String> {
+        Self::handle_main_command_impl(state, command_string)
+            .await
+            .into()
+    }
+
+    async fn handle_main_command_impl(
+        state: Arc<State>,
+        command_string: String,
+    ) -> Result<MainCommandResponse, (StatusCode, String)> {
+        let command = Command::parse(&command_string).map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("Error parsing command: {e}"),
+            )
+        })?;
+
+        let (sender, receiver) = oneshot::channel();
+
+        {
+            state
+                .peers
+                .read()
+                .await
+                .queue_command(command, sender)
+                .await
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Error queuing command: {e}"),
+                    )
+                })?;
+        }
+
+        receiver
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Error receiving response: {e}"),
+                )
+            })?
+            .map_err(|e| (StatusCode::OK, format!("Command failed: {e}")))
+    }
+
+    async fn handle_replication_transaction(
+        AxumState(state): AxumState<Arc<State>>,
+        Query(ReplicationQuery { hash }): Query<ReplicationQuery>,
+        body: Bytes,
+    ) -> JsonResult<TransactionCommandResponse, String> {
+        Self::handle_replication_transaction_impl(state, body, hash)
+            .await
+            .into()
+    }
+
+    async fn handle_replication_transaction_impl(
+        state: Arc<State>,
+        body: Bytes,
+        hash: u32,
+    ) -> Result<TransactionCommandResponse, (StatusCode, String)> {
+        let ReplicationTransactionRequest {
+            transaction,
+            origin,
+        } = cbor4ii::serde::from_slice(&body).map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("Failed to deserialize transaction data: {e}"),
+            )
+        })?;
+
+        tracing::info!("Received transaction for {hash} raft");
+
+        let replication_client = {
+            state
+                .peers
+                .read()
+                .await
+                .replication_states
+                .get(&hash)
+                .ok_or_else(|| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        "Replication hash not found".to_string(),
+                    )
+                })?
+                .client
+                .clone()
+        };
+
+        let response = replication_client
+            .send_command(transaction.into_owned(), origin)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to send transaction: {e}"),
+                )
+            })?;
+
+        Ok(match response {
+            Ok(response) => response,
+            Err((CommandError::Leader(id), _)) => TransactionCommandResponse::Leader(id),
+            Err((CommandError::NoLeader, _)) => TransactionCommandResponse::NoLeader,
+            Err((e, _)) => {
+                let error = error::CommandError::from(e);
+                TransactionCommandResponse::Failure(format!(
+                    "Failed to send command to raft: {error}"
+                ))
+            }
+        })
     }
 
     async fn handle_peers(
@@ -684,11 +880,11 @@ impl Client {
                     tracing::info!("Configuration updated successfully");
                     true
                 }
-                Err(raft::CommandError::NotEnoughNodes) => {
+                Err((raft::CommandError::NotEnoughNodes, _)) => {
                     tracing::info!("Not enough nodes in configuration");
                     true
                 }
-                Err(e) => {
+                Err((e, _)) => {
                     tracing::info!("Failed to update configuration: {e:?}");
                     false
                 }
@@ -704,12 +900,13 @@ async fn main() -> anyhow::Result<()> {
         .with(EnvFilter::from_default_env())
         .init();
 
-    let cli = Cli::parse();
+    let cli = Arc::new(Cli::parse());
     let client_builder = ClientBuilder::new(cli.clone());
 
     let peers = cli
         .peers
-        .into_iter()
+        .iter()
+        .copied()
         .chain(Some(cli.port))
         .map(Id)
         .collect::<HashSet<_>>();
